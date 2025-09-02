@@ -1,0 +1,170 @@
+---
+title: "POCA_dataworkup_and_volcano_plots"
+output: html_document
+---
+Aggregate the data; takes several minutes
+```{r setup, include=FALSE}
+library(pbapply)
+library(stringr)
+library(ggplot2)
+library(reshape2)
+library(stringr)
+library(ggrepel)
+library(RColorBrewer)
+library(readxl)
+library(tidyverse)
+library(dplyr)
+
+setwd("~/WORKINGDIRECTORY") ##folder with Fragpipe Output
+fnames<-list.files()[c(1)] ##change number to the number of the folder that has the data. Run "fnames<-list.files()" followed by "fnames" and put the number corresponding to the folder with the imputed output from Perseus.
+#this document is set up for a nine-column file structure:
+#col1: header = "ProteinID" (no space) and contains uniprot accession #s for the proteins
+#col2: header = "Gene" contains the 'primary gene name' from uniprot
+#col3: header = "Description"
+#col4-6 header is not important, these rows contain the intensities for the 3 replicates in the "control" group (proteins enriched in this group will be plotted on the left side of the volcano)
+#col7-9 header is not important, these rows contain the intensities for the 3 replicates in the "treatment" group (proteins enriched in this group will be plotted on the left side of the volcano)
+files = lapply(paste(fnames,"xxx.csv", sep= "/"), read.csv, sep = ",") 
+
+functi<-function(x) {toString(paste(unique(x), sep = ','))}
+#take relevent columns
+
+for (i in 1:length(files)){
+    print(i)
+    files[[i]]<-files[[i]][,c(1:9)]
+    #files[[i]]<-files[[i]][-grep("contam",files[[i]][,1]),]
+    colnames(files[[i]])<-c("ProteinID","Gene","Description",paste(substring(fnames[i],1,nchar(fnames[i])),"Total Intensity",sep="-"))
+    mat<-as.matrix(files[[i]])
+}
+```
+
+Merge the data into one long-form dataset with ratios as columns and re-arrange columns
+```{r cars}
+merged.data.frame = Reduce(function(...) merge(..., all=T), files) 
+```
+
+Formatting the data.frame for plot
+```{r}
+df<-merged.data.frame
+df[,4:9]<-sapply(df[,4:9], as.numeric) ##convert to numeric
+df<-df[complete.cases(df),]
+```
+
+This block tests the variance of the values and calculates t.test p values with unequal and equal variances:
+```{r}
+#test variance
+vartest <- function(df, grp1, grp2) {
+x = as.numeric(df[grp1])
+y = as.numeric(df[grp2])
+results = var.test(x, y) ##variances equal, independent
+results$p.value
+}
+varpvalue = apply(df, 1, vartest, grp1 = c(4:6), grp2 = c(7:9))
+
+#ttest for groups
+ttest <- function(df, grp1, grp2) {
+    x = as.numeric(df[grp1])
+    y = as.numeric(df[grp2])
+    results = t.test(x, y,var.equal = T) ##variances equal, independent
+    results$p.value
+ }
+rawpvalue1 = apply(df, 1, ttest, grp1 = c(4:6), grp2 = c(7:9))
+
+##ttest for groups with variances unequal
+ttest2 <- function(df, grp1, grp2) {
+    x = as.numeric(df[grp1])
+    y = as.numeric(df[grp2])
+    results = t.test(x, y,var.equal = F) ##variances unequal, independent
+    results$p.value
+ }
+rawpvalue2 = apply(df, 1, ttest2, grp1 = c(4:6), grp2 = c(7:9))
+```
+
+Calculate the foldchange and p-values; edit the labels for the plot.
+```{r}
+control = apply(df[,4:6], 1, mean) #control
+test = apply(df[,7:9], 1, mean) #treatment
+foldchange <- test-control #test/control foldchange
+foldchange[foldchange > log2(225)] <- log2(225) #changing values >15 to 15
+foldchange[foldchange < -log2(225)] <- -log2(225) #changing values >15 to 15
+hist(foldchange, xlab = "log2 Fold Change (Control vs Test)")
+```
+
+Compile fold-changes and p-values into one place
+```{r}
+results = cbind(foldchange, rawpvalue1, rawpvalue2, varpvalue)
+results = as.data.frame(results)
+results$rawpvalue1[results$varpvalue < 0.05] <- NA  #keep the right p value
+results$rawpvalue2[results$varpvalue > 0.05] <- NA  #keep the right p value
+results$rawpvalue1<-apply(results[,2:3], 1, function(x) toString(na.omit(x)))  #keep the right p value
+results$rawpvalue1<-as.numeric(results$rawpvalue1)
+results<-results[,1:2]
+results$protein <- df[,1]
+results$label <- df[,2] #take the Gene for labels
+results$diffexpressed <- "NO"
+results$diffexpressed[results$foldchange > 1 & results$rawpvalue < 0.05] <- "UP"  ##sets enrichment criteria
+results$diffexpressed[results$foldchange < -1 & results$rawpvalue < 0.05] <- "DOWN"
+results$selected_labels <- NA # Add 'selected_labels' column with NA values
+results2<-results  ##this contains all labels and values
+colnames(results2) <- c("FC", "p_value", "ProteinID", "label", "diffexpressed", "selected_labels")
+```
+
+Selecting which proteins to label in volcano plot - allows for custom protein labels (i.e. you want the label "SR-B1" instead of the gene name "SCARB1"). File needs to be two columns, col1 header = "ProteinID" and contains UniProt accession #, col2 header = "Selected_labels" (CAPITAL 'S') and contains what you want the label to be. Run this first before setting protein subset groups
+```{r} 
+protein_labels <- read_excel("~/")
+results2 <- results2 %>%
+  left_join(protein_labels, by = "ProteinID") %>%
+  mutate(selected_labels = ifelse(is.na(Selected_labels), selected_labels, Selected_labels)) %>% 
+  select(-Selected_labels)
+```
+
+Alternative labeling strategy: provide excel file with one column containing Uniprot accession numbers with the header 'ProteinID' and the label will be populated as the gene from the original dataframe (i.e. it uses the Gene label that already exists in the data). Useful if you don't have custom labels for any of your proteins
+```{r}
+protein_labels <- read.csv("~/")
+results2 <- results2 %>%
+  mutate(matching_protein = ProteinID %in% protein_labels$ProteinID) %>%
+  mutate(selected_labels = ifelse(matching_protein, label, selected_labels)) %>%
+  select(-matching_protein)
+```
+
+Setting protein subset groups (which proteins you want colored differently on volcano, i.e. all mito proteins, cholesterol-binding proteins, etc.)
+```{r} 
+#labeling nucleoporins
+NUP_list <- read.csv("~/")
+results2[!results2$ProteinID%in%NUP_list$`ProteinID`,]$label<- NA
+results2[results2$ProteinID%in%NUP_list$`ProteinID`,]$diffexpressed<-paste("NUP",results2[results2$ProteinID%in%NUP_list$`ProteinID`,]$diffexpressed,sep="_")
+results2$diffexpressed<-factor(results2$diffexpressed,levels=c("NO","UP","NUP_NO","NUP_UP","NUP_DOWN","DOWN"))
+results2$label <- as.character(results2$label)
+results2$label[which(results2$diffexpressed == "NO")] <- NA
+results2$label <- factor(results2$label)
+```
+
+Make the volcano plot
+```{r}
+volcano = ggplot(data = results2, aes(x = FC, y = -1*log10(p_value)))
+p <- volcano + geom_point(aes(col = diffexpressed), size = 1.0, alpha = 0.8) +
+    scale_color_manual(values = c("grey", "light grey", "#be4a80", "light blue", "black", "black")) + ###can adjust the colors with hex codes or words. levels=c("NO","UP","NUP_NO","NUP_UP","NUP_DOWN","DOWN")
+    geom_vline(xintercept = c(-1, 1), col = "black", linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), col = "black", linetype = "dashed") +
+    geom_label_repel(aes(label = selected_labels), segment.color = 'black', force = 10) + #this generates text labels for the list you designated above. Hash it out if you don't want text labels
+    theme_classic(base_size = 20) +
+    labs(title = "", y = "", x = "") +
+    theme(legend.position = "none") +
+    scale_x_continuous(limits = c(-8, 8), breaks = seq(-7.5, 7.5, 2.5))
+#this section generates black circles around the datapoints with values in the "selected_labels" column from "results2"
+p <- p + geom_point(
+  data = subset(results2, as.character(selected_labels) %in% levels(factor(selected_labels))),
+  aes(x = FC, y = -1 * log10(p_value)),
+  color = "black",
+  size = 1.5,
+  stroke = 1.0,
+  shape = 1
+)
+
+p
+```
+
+```{r}
+saveRDS(p, file="volcano_rds.rds")
+ggsave("volcano_png.png", width = 7, height = 6, dpi=1200) 
+write.csv(results2, file="results_FC1-p05.csv",row.names = F) #writes an excel file with fold-changes, p-values, and "diffexpressed" parameter
+```
